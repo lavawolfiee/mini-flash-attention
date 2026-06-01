@@ -84,8 +84,24 @@ __global__ void FlashAttnKernel(
         __syncthreads();  // signals that keys/values are loaded into smem
 
         // processing loaded K/Vs by all warps
+        half qFrag[ROWS_PER_WARP][D_PER_THREAD];
+
+        for (size_t r = 0; r < ROWS_PER_WARP; ++r) {
+            for (size_t k = 0, j = laneId; k < D_PER_THREAD; ++k, j += 32) {
+                qFrag[r][k] = Qs[(warpBaseRow + r) * D + j];
+            }
+        }
+
         #pragma unroll
         for (size_t kIdx = 0; kIdx < Bc; ++kIdx) {
+            half kLocal[D_PER_THREAD];
+            half vLocal[D_PER_THREAD];
+
+            #pragma unroll
+            for (size_t j = laneId, k = 0; k < D_PER_THREAD; j += 32, ++k) {
+                kLocal[k] = Ks[kIdx * D + j];
+                vLocal[k] = Vs[kIdx * D + j];
+            }
 
             #pragma unroll
             for (size_t r = 0; r < ROWS_PER_WARP; ++r) {
@@ -93,7 +109,7 @@ __global__ void FlashAttnKernel(
 
                 #pragma unroll
                 for (size_t j = laneId, k = 0; k < D_PER_THREAD; j += 32, ++k) {
-                    s += __half2float(__hmul(Qs[(warpBaseRow + r) * D + j], Ks[kIdx * D + j]));
+                    s += __half2float(__hmul(qFrag[r][k], kLocal[k]));
                 }
 
                 s = ReduceWarpSum(s) * scale;
@@ -108,7 +124,7 @@ __global__ void FlashAttnKernel(
 
                 #pragma unroll
                 for (size_t j = laneId, k = 0; k < D_PER_THREAD; j += 32, ++k) {
-                    o[r][k] = o[r][k] * alpha + p * __half2float(Vs[kIdx * D + j]);
+                    o[r][k] = o[r][k] * alpha + p * __half2float(vLocal[k]);
                 }
             }
         }
