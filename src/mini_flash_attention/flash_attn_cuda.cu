@@ -26,14 +26,18 @@ __global__ void FlashAttnKernel(
     float scale,
     bool causal
 ) {
+    constexpr size_t NUM_WARPS = ceil_div(BLOCK_SIZE, 32);
+    constexpr size_t D_PER_THREAD = D / 32;
+    constexpr size_t ROWS_PER_WARP = Br / NUM_WARPS;
+    static_assert(D % 32 == 0);
+    static_assert(Br % NUM_WARPS == 0);
+
     size_t headIdx = blockIdx.y;
     size_t qBaseIdx = blockIdx.x * Br;
     size_t tid = threadIdx.x;
     size_t warpId = tid / 32;
     size_t laneId = tid % 32;
-    constexpr size_t NUM_WARPS = ceil_div(BLOCK_SIZE, 32);
-    constexpr size_t D_PER_THREAD = ceil_div(D, 32);
-    static_assert(D % 32 == 0);
+    size_t warpBaseRow = warpId * ROWS_PER_WARP;
 
     // moving ptrs to the beggining of the working area
     q += (headIdx * N + qBaseIdx) * D;
@@ -50,13 +54,19 @@ __global__ void FlashAttnKernel(
     }
 
     // each warp processes on q row
-    float m = -INFINITY;
-    float denom = 0.0f;
-    float o[D_PER_THREAD];
+    float m[ROWS_PER_WARP];
+    float denom[ROWS_PER_WARP];
+    float o[ROWS_PER_WARP][D_PER_THREAD];
 
     #pragma unroll
-    for (size_t k = 0; k < D_PER_THREAD; ++k) {
-        o[k] = 0.0f;
+    for (size_t r = 0; r < ROWS_PER_WARP; ++r) {
+        m[r] = -INFINITY;
+        denom[r] = 0.0f;
+
+        #pragma unroll
+        for (size_t k = 0; k < D_PER_THREAD; ++k) {
+            o[r][k] = 0.0f;
+        }
     }
 
     // iterating over K/Vs
@@ -76,26 +86,30 @@ __global__ void FlashAttnKernel(
         // processing loaded K/Vs by all warps
         #pragma unroll
         for (size_t kIdx = 0; kIdx < Bc; ++kIdx) {
-            float s = 0.0f;
 
             #pragma unroll
-            for (size_t j = laneId, k = 0; k < D_PER_THREAD; j += 32, ++k) {
-                s += __half2float(__hmul(Qs[warpId * D + j], Ks[kIdx * D + j]));
-            }
+            for (size_t r = 0; r < ROWS_PER_WARP; ++r) {
+                float s = 0.0f;
 
-            s = ReduceWarpSum(s) * scale;
+                #pragma unroll
+                for (size_t j = laneId, k = 0; k < D_PER_THREAD; j += 32, ++k) {
+                    s += __half2float(__hmul(Qs[(warpBaseRow + r) * D + j], Ks[kIdx * D + j]));
+                }
 
-            // online softmax calculation
-            float mNew = fmaxf(m, s);
-            float alpha = __expf(m - mNew);
-            float p = __expf(s - mNew);
+                s = ReduceWarpSum(s) * scale;
 
-            denom = denom * alpha + p;
-            m = mNew;
+                // online softmax calculation
+                float mNew = fmaxf(m[r], s);
+                float alpha = __expf(m[r] - mNew);
+                float p = __expf(s - mNew);
 
-            #pragma unroll
-            for (size_t j = laneId, k = 0; k < D_PER_THREAD; j += 32, ++k) {
-                o[k] = o[k] * alpha + p * __half2float(Vs[kIdx * D + j]);
+                denom[r] = denom[r] * alpha + p;
+                m[r] = mNew;
+
+                #pragma unroll
+                for (size_t j = laneId, k = 0; k < D_PER_THREAD; j += 32, ++k) {
+                    o[r][k] = o[r][k] * alpha + p * __half2float(Vs[kIdx * D + j]);
+                }
             }
         }
 
@@ -106,9 +120,13 @@ __global__ void FlashAttnKernel(
         __syncthreads();  // signals that K/Vs in smem were used and are no longer needed
     }
 
-    float denomInv = 1.0f / denom;
-    for (size_t j = laneId, k = 0; k < D_PER_THREAD; j += 32, ++k) {
-        out[warpId * D + j] = __float2half(o[k] * denomInv);
+    #pragma unroll
+    for (size_t r = 0; r < ROWS_PER_WARP; ++r) {
+        float denomInv = 1.0f / denom[r];
+
+        for (size_t j = laneId, k = 0; k < D_PER_THREAD; j += 32, ++k) {
+            out[(warpBaseRow + r) * D + j] = __float2half(o[r][k] * denomInv);
+        }
     }
 }
 
@@ -126,7 +144,9 @@ void launch_flash_attn_forward(
     cudaStream_t stream
 ) {
     constexpr size_t BLOCK_SIZE = 512;
-    constexpr size_t Br = BLOCK_SIZE / 32;
+    constexpr size_t ROWS_PER_WARP = 8;
+    constexpr size_t WARPS_PER_BLOCK = BLOCK_SIZE / 32;
+    constexpr size_t Br = ROWS_PER_WARP * WARPS_PER_BLOCK;
     constexpr size_t Bc = 128;
 
     if (N % Br != 0 || N % Bc != 0) {

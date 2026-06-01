@@ -8,7 +8,7 @@ from mini_flash_attention import forward
 @pytest.mark.parametrize(
     ("B", "H", "N", "D"),
     [
-        (1, 1, 64, 32),
+        (1, 1, 128, 32),
         (1, 2, 128, 64),
         (2, 1, 256, 64),
         (2, 3, 128, 128),
