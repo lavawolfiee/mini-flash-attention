@@ -69,21 +69,14 @@ __global__ void FlashAttnWmmaQKKernel(
 
     // Q/K/V are stored in shared memory in simple row-major layout.
     // This is not the final FA2 swizzled layout, but it is much easier to debug.
-    // Ks are also reused later to store output O tile float [16, 16] per warp
     __shared__ half Qs[Br * D];      // [Br, D] = [64, 64]
     __shared__ half Ks[Bc * D];      // [Bc, D] = [64, 64]
     __shared__ half Vs[Bc * D];      // [Bc, D] = [64, 64]
 
-    // After WMMA QK^T it stores raw fp32 scores [Br, Bc].
+    // Scores is used twice:
+    // 1. after WMMA QK^T it stores raw fp32 scores [Br, Bc]
+    // 2. after softmax it stores fp32 probabilities P [Br, Bc]
     __shared__ float Scores[Br * Bc];
-
-    // Softmax probabilities in fp16 for WMMA P @ V.
-    __shared__ half P[Br * Bc];
-
-    // One tile of P @ V output, stored after WMMA and then transfered to registers.
-    // Ks are not used after computing Scores, so we can reuse its shared memory.
-    float* O = reinterpret_cast<float*>(Ks) + warpId * 16 * 16;  // [16, 16] per warp
-    static_assert(NUM_WARPS * 16 * 16 * 4 <= Bc * D * 2);
 
     // loading Q block once: global -> shared
     for (size_t i = tid; i < Br * D; i += BLOCK_SIZE) {
@@ -163,9 +156,6 @@ __global__ void FlashAttnWmmaQKKernel(
         // ------------------------------------------------------------
         // 2. Blockwise online softmax.
         //
-        // Unlike the previous scalar version, we do not update softmax
-        // statistics for every single key separately.
-        //
         // For each row:
         //   blockMax = max scores in current K block
         //   mNew = max(old m, blockMax)
@@ -208,7 +198,7 @@ __global__ void FlashAttnWmmaQKKernel(
                 float s = Scores[row * Bc + col] * scale;
                 float p = __expf(s - mNew);
 
-                P[row * Bc + col] = __float2half(p);
+                Scores[row * Bc + col] = p;
                 localDenomAdd += p;
             }
 
@@ -220,53 +210,32 @@ __global__ void FlashAttnWmmaQKKernel(
         __syncthreads();
 
         // ------------------------------------------------------------
-        // 3. Compute O += P @ V using WMMA
+        // 3. Compute O += P @ V.
         //
-        // Each warp computes [16, 64] x [64, 64] = [16, 64] output
-        // tile which we split into 4 tiles [16, 16] by columns (D):
-        //   O[16,16] = P[16,64] @ V[64,16]
-        // One [16, 16] tile requires 4x WMMA calls.
-        // Each [16, 16] output tile is stored in shared memory
-        // and then transfered to registers.
+        // Intentionally keeping P@V scalar. WMMA P@V was actually
+        // a little bit slower because it needed to write output tile
+        // to shared memory and then read it again. To avoid this
+        // we need to use inline PTX or CuTe/CUTLASS
         // ------------------------------------------------------------
 
         #pragma unroll
-        for (size_t dBlock = 0; dBlock < D; dBlock += 16) {
-            // creating fragments
-            wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> pFrag;
-            wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> vFrag;
-            wmma::fragment<wmma::accumulator, 16, 16, 16, float> oFrag;
-
-            wmma::fill_fragment(oFrag, 0.0f);
+        for (size_t r = 0; r < ROWS_PER_WARP; ++r) {
+            size_t row = warpBaseRow + r;
 
             #pragma unroll
-            for (size_t valBlock = 0; valBlock < Bc; valBlock += 16) {
-                const half* pTilePtr = P + (warpBaseRow * Bc + valBlock);
-                const half* vTilePtr = Vs + (valBlock * D + dBlock);
+            for (size_t dd = 0; dd < D_PER_THREAD; ++dd) {
+                size_t d = laneId + dd * 32;
 
-                wmma::load_matrix_sync(pFrag, pTilePtr, Bc);
-                wmma::load_matrix_sync(vFrag, vTilePtr, D);
-                wmma::mma_sync(oFrag, pFrag, vFrag, oFrag);
-            }
+                float acc = 0.0f;
 
-            // store output tile in shared memory and add to accumulators in registers
-            // TODO optimization: do this without using shared memory
-            float* oTilePtr = O;
-            wmma::store_matrix_sync(oTilePtr, oFrag, 16, wmma::mem_row_major);
-            __syncwarp();
-
-            // output columns [dBlock; dBlock + 16]
-            // TODO: maybe rewrite this?
-            if (dBlock <= laneId && laneId < dBlock + 16) {
                 #pragma unroll
-                for (size_t rowLocal = 0; rowLocal < ROWS_PER_WARP; ++rowLocal) {
-                    o[rowLocal][0] += O[rowLocal * 16 + (laneId % 16)];
+                for (size_t col = 0; col < Bc; ++col) {
+                    float p = Scores[row * Bc + col];
+                    float vVal = __half2float(Vs[col * D + d]);
+                    acc += p * vVal;
                 }
-            } else if (dBlock <= laneId + 32 && laneId + 32 < dBlock + 16) {
-                #pragma unroll
-                for (size_t rowLocal = 0; rowLocal < ROWS_PER_WARP; ++rowLocal) {
-                    o[rowLocal][1] += O[rowLocal * 16 + (laneId % 16)];
-                }
+
+                o[r][dd] += acc;
             }
         }
 
