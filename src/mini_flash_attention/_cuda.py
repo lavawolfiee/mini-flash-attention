@@ -19,6 +19,7 @@ def _load_extension():
         root / "flash_attn.cpp",
         root / "flash_attn_cuda.cu",
     ]
+    cutlass_include = root.parents[1] / "third_party" / "cutlass" / "include"
 
     if "TORCH_CUDA_ARCH_LIST" not in os.environ and torch.cuda.is_available():
         major, minor = torch.cuda.get_device_capability()
@@ -27,8 +28,9 @@ def _load_extension():
     _EXTENSION = load(
         name="flash_attn_cuda",
         sources=[str(path) for path in sources],
-        extra_cflags=["-O2"],
-        extra_cuda_cflags=["-O2"],
+        extra_cflags=["-O3"],
+        extra_cuda_cflags=["-O3", "--use_fast_math"],
+        extra_include_paths=[str(cutlass_include)],
         verbose=False,
     )
     return _EXTENSION
