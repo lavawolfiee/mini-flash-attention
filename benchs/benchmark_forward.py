@@ -79,6 +79,22 @@ class OursBackend:
         return self.forward(q, k, v, causal=causal)
 
 
+class WmmaBackend:
+    name = "wmma"
+
+    def __init__(self) -> None:
+        from mini_flash_attention import forward_wmma
+
+        self.forward = forward_wmma
+
+    def prepare(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> PreparedInput:
+        return q, k, v
+
+    def run(self, inputs: PreparedInput, causal: bool) -> torch.Tensor:
+        q, k, v = inputs
+        return self.forward(q, k, v, causal=causal)
+
+
 class TorchBackend:
     name = "torch"
 
@@ -160,7 +176,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--backend",
         required=True,
-        choices=["ours", "torch", "fa1", "fa2"],
+        choices=["ours", "wmma", "torch", "fa1", "fa2"],
         help="Implementation to benchmark. FA1 and FA2 should run in separate environments.",
     )
     parser.add_argument("--out", type=Path, default=Path("benchs/results/forward.jsonl"))
@@ -180,6 +196,8 @@ def parse_args() -> argparse.Namespace:
 def load_backend(name: str) -> Backend:
     if name == "ours":
         return OursBackend()
+    if name == "wmma":
+        return WmmaBackend()
     if name == "torch":
         return TorchBackend()
     if name == "fa1":

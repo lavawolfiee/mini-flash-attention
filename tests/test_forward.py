@@ -1,10 +1,11 @@
 import pytest
 import torch
 
-from mini_flash_attention import forward
+from mini_flash_attention import forward, forward_wmma
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("fn", [forward, forward_wmma])
 @pytest.mark.parametrize(
     ("B", "H", "N", "D"),
     [
@@ -15,7 +16,7 @@ from mini_flash_attention import forward
         (1, 2, 2048, 64),
     ],
 )
-def test_forward_matches_naive_attention(B, H, N, D):
+def test_forward_matches_naive_attention(fn, B, H, N, D):
     torch.manual_seed(0)
 
     causal = False
@@ -32,6 +33,6 @@ def test_forward_matches_naive_attention(B, H, N, D):
     probs = torch.softmax(scores, dim=-1)
     expected = (probs @ v.float()).to(torch.float16)
 
-    actual = forward(q, k, v, causal=causal)
+    actual = fn(q, k, v, causal=causal)
 
     torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)

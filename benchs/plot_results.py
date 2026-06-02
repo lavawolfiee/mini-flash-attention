@@ -12,6 +12,16 @@ METRICS = {
     "tflops": ("tflops_s", "TFLOPs/s", "tflops_bars.png"),
 }
 
+BACKEND_ORDER = ["fa2", "fa1", "ours", "wmma", "torch"]
+
+BACKEND_LABELS = {
+    "fa2": "FlashAttention-2",
+    "fa1": "FlashAttention-1",
+    "ours": "Ours (CuTe)",
+    "wmma": "Ours (WMMA)",
+    "torch": "Pytorch",
+}
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Plot benchmark_forward.py JSONL results.")
@@ -68,7 +78,10 @@ def latest_rows(rows: list[dict]) -> list[dict]:
 
 def grouped_values(rows: list[dict], metric: str) -> tuple[list[int], list[str], dict[tuple[int, str], float]]:
     seq_lens = sorted({row["seq_len"] for row in rows})
-    backends = sorted({row["backend"] for row in rows})
+    available_backends = {row["backend"] for row in rows}
+    ordered_backends = [backend for backend in BACKEND_ORDER if backend in available_backends]
+    extra_backends = sorted(available_backends - set(BACKEND_ORDER))
+    backends = ordered_backends + extra_backends
     values = {(row["seq_len"], row["backend"]): row[metric] for row in rows}
     return seq_lens, backends, values
 
@@ -94,7 +107,7 @@ def plot_metric(rows: list[dict], metric: str, ylabel: str, title: str, out_path
 
         positions = [x + offset for x, _ in points]
         heights = [height for _, height in points]
-        bars = ax.bar(positions, heights, width=bar_width, label=backend)
+        bars = ax.bar(positions, heights, width=bar_width, label=BACKEND_LABELS.get(backend, backend))
         ax.bar_label(bars, fmt="%.2f", padding=2, fontsize=8)
 
     ax.set_xticks(x_positions)

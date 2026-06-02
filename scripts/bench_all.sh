@@ -53,6 +53,7 @@ run_backend() {
 }
 
 run_backend ours .venv/bin/python
+run_backend wmma .venv/bin/python
 run_backend torch .venv/bin/python
 run_backend fa1 .bench/fa1/bin/python
 run_backend fa2 .bench/fa2/bin/python

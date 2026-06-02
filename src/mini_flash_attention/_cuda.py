@@ -18,6 +18,7 @@ def _load_extension():
     sources = [
         root / "flash_attn.cpp",
         root / "flash_attn_cuda.cu",
+        root / "flash_attn_wmma_cuda.cu",
     ]
     cutlass_include = root.parents[1] / "third_party" / "cutlass" / "include"
 
@@ -38,3 +39,7 @@ def _load_extension():
 
 def forward(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, causal: bool = False) -> torch.Tensor:
     return _load_extension().forward(q, k, v, causal)
+
+
+def forward_wmma(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, causal: bool = False) -> torch.Tensor:
+    return _load_extension().forward_wmma(q, k, v, causal)

@@ -18,7 +18,31 @@ void launch_flash_attn_forward(
     bool causal,
     cudaStream_t stream);
 
-torch::Tensor flash_attn_forward(
+void launch_flash_attn_forward_wmma(
+    const half* q,
+    const half* k,
+    const half* v,
+    half* out,
+    int BH,
+    int N,
+    int D,
+    float scale,
+    bool causal,
+    cudaStream_t stream);
+
+using LaunchForwardFn = void (*)(
+    const half* q,
+    const half* k,
+    const half* v,
+    half* out,
+    int BH,
+    int N,
+    int D,
+    float scale,
+    bool causal,
+    cudaStream_t stream);
+
+void check_forward_inputs(
     torch::Tensor q,
     torch::Tensor k,
     torch::Tensor v,
@@ -48,14 +72,28 @@ torch::Tensor flash_attn_forward(
   TORCH_CHECK(B * H <= std::numeric_limits<int>::max(), "B * H is too large");
   TORCH_CHECK(N <= std::numeric_limits<int>::max(), "N is too large");
   TORCH_CHECK(D <= std::numeric_limits<int>::max(), "D is too large");
+}
+
+torch::Tensor flash_attn_forward_impl(
+    torch::Tensor q,
+    torch::Tensor k,
+    torch::Tensor v,
+    bool causal,
+    LaunchForwardFn launch_forward) {
+  check_forward_inputs(q, k, v, causal);
 
   const c10::cuda::CUDAGuard device_guard(q.device());
   auto out = torch::zeros_like(q);
 
+  const auto B = q.size(0);
+  const auto H = q.size(1);
+  const auto N = q.size(2);
+  const auto D = q.size(3);
+
   const int BH = static_cast<int>(B * H);
   const float scale = 1.0f / std::sqrt(static_cast<float>(D));
 
-  launch_flash_attn_forward(
+  launch_forward(
       reinterpret_cast<const half*>(q.data_ptr<at::Half>()),
       reinterpret_cast<const half*>(k.data_ptr<at::Half>()),
       reinterpret_cast<const half*>(v.data_ptr<at::Half>()),
@@ -70,6 +108,23 @@ torch::Tensor flash_attn_forward(
   return out;
 }
 
+torch::Tensor flash_attn_forward(
+    torch::Tensor q,
+    torch::Tensor k,
+    torch::Tensor v,
+    bool causal) {
+  return flash_attn_forward_impl(q, k, v, causal, launch_flash_attn_forward);
+}
+
+torch::Tensor flash_attn_forward_wmma(
+    torch::Tensor q,
+    torch::Tensor k,
+    torch::Tensor v,
+    bool causal) {
+  return flash_attn_forward_impl(q, k, v, causal, launch_flash_attn_forward_wmma);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("forward", &flash_attn_forward, "Mini Flash Attention forward");
+  m.def("forward_wmma", &flash_attn_forward_wmma, "Mini Flash Attention WMMA forward");
 }
