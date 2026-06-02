@@ -95,7 +95,8 @@ template <
     typename CoordTensor,
     typename Element,
     size_t ROWS_PER_WARP,
-    size_t Bc
+    size_t Bc,
+    size_t Bc_PAD
 >
 __forceinline__ __device__ void SoftmaxAccSToPShared(
     AccTensor& accS,
@@ -153,7 +154,7 @@ __forceinline__ __device__ void SoftmaxAccSToPShared(
         float s = float(accS(i)) * scale;
         float p = __expf(s - mNew[row]);
 
-        P[(warpBaseRow + row) * Bc + col] = Element(p);
+        P[(warpBaseRow + row) * Bc_PAD + col] = Element(p);
         localDenomAdd[row] += p;
     }
 
@@ -232,10 +233,13 @@ __global__ void FlashAttnCuteKernel(
     // Total ~32 KB/block instead of ~40 KB/block in the previous Scores version.
     // -------------------------------------------------------------------------
 
-    __shared__ Element Qs[Br * D];       // [64, 64]
-    __shared__ Element Ks[Bc * D];       // [64, 64]
-    __shared__ Element Vs[Bc * D];       // [64, 64]
-    __shared__ Element P[Br * Bc];       // [64, 64], half probabilities
+    constexpr size_t D_PAD = 72;
+    constexpr size_t Bc_PAD = 72;
+
+    __shared__ Element Qs[Br * D_PAD];       // [64, 64]
+    __shared__ Element Ks[Bc * D_PAD];       // [64, 64]
+    __shared__ Element Vs[Bc * D_PAD];       // [64, 64]
+    __shared__ Element P[Br * Bc_PAD];       // [64, 64], half probabilities
 
     // -------------------------------------------------------------------------
     // CuTe MMA setup.
@@ -281,10 +285,10 @@ __global__ void FlashAttnCuteKernel(
     // -------------------------------------------------------------------------
 
     Tensor sQ = make_tensor(
-        make_smem_ptr(Qs + warpBaseRow * D),
+        make_smem_ptr(Qs + warpBaseRow * D_PAD),
         make_layout(
             make_shape(Int<ROWS_PER_WARP>{}, Int<D>{}),
-            make_stride(Int<D>{}, Int<1>{})
+            make_stride(Int<D_PAD>{}, Int<1>{})
         )
     );
 
@@ -292,15 +296,15 @@ __global__ void FlashAttnCuteKernel(
         make_smem_ptr(Ks),
         make_layout(
             make_shape(Int<Bc>{}, Int<D>{}),       // [N,K] for QK
-            make_stride(Int<D>{}, Int<1>{})        // Ks[key, d]
+            make_stride(Int<D_PAD>{}, Int<1>{})        // Ks[key, d]
         )
     );
 
     Tensor sP = make_tensor(
-        make_smem_ptr(P + warpBaseRow * Bc),
+        make_smem_ptr(P + warpBaseRow * Bc_PAD),
         make_layout(
             make_shape(Int<ROWS_PER_WARP>{}, Int<Bc>{}),
-            make_stride(Int<Bc>{}, Int<1>{})
+            make_stride(Int<Bc_PAD>{}, Int<1>{})
         )
     );
 
@@ -308,7 +312,7 @@ __global__ void FlashAttnCuteKernel(
         make_smem_ptr(Vs),
         make_layout(
             make_shape(Int<D>{}, Int<Bc>{}),       // [N,K] for P@V
-            make_stride(Int<1>{}, Int<D>{})        // sVt[d,key] = Vs[key,d]
+            make_stride(Int<1>{}, Int<D_PAD>{})        // sVt[d,key] = Vs[key,d]
         )
     );
 
@@ -339,7 +343,9 @@ __global__ void FlashAttnCuteKernel(
     // -------------------------------------------------------------------------
 
     for (size_t i = tid; i < Br * D; i += BLOCK_SIZE) {
-        Qs[i] = qElem[i];
+        size_t row = i / D;
+        size_t col = i % D;
+        Qs[row * D_PAD + col] = qElem[i];
     }
     __syncthreads();
 
@@ -365,8 +371,10 @@ __global__ void FlashAttnCuteKernel(
         // ---------------------------------------------------------------------
 
         for (size_t i = tid; i < Bc * D; i += BLOCK_SIZE) {
-            Ks[i] = kElem[kvBaseIdx * D + i];
-            Vs[i] = vElem[kvBaseIdx * D + i];
+            size_t row = i / D;
+            size_t col = i % D;
+            Ks[row * D_PAD + col] = kElem[kvBaseIdx * D + i];
+            Vs[row * D_PAD + col] = vElem[kvBaseIdx * D + i];
         }
         __syncthreads();
 
@@ -392,7 +400,7 @@ __global__ void FlashAttnCuteKernel(
         // It also updates m/denom and computes alpha for old accO rescale.
         // ---------------------------------------------------------------------
 
-        SoftmaxAccSToPShared<decltype(accS), decltype(tScS), Element, ROWS_PER_WARP, Bc>(
+        SoftmaxAccSToPShared<decltype(accS), decltype(tScS), Element, ROWS_PER_WARP, Bc, Bc_PAD>(
             accS,
             tScS,
             P,
