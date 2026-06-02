@@ -43,6 +43,16 @@ __forceinline__ __device__ float ReduceWarpMax(float x) {
 }
 
 
+// -----------------------------------------------------------------------------
+// Shared-memory swizzled layouts.
+//
+// Important:
+//   - These layouts describe the full shared tile.
+//   - Warp-local tiles are created by local_tile(full_tensor, ...).
+//   - We do NOT create a separate "warp swizzled layout".
+//     This keeps all shared writes/reads consistent and reduces layout pressure.
+// -----------------------------------------------------------------------------
+
 template <size_t Rows, size_t Cols>
 CUTE_HOST_DEVICE constexpr auto MakeRowMajorSwizzledLayout() {
     return composition(
@@ -55,6 +65,15 @@ CUTE_HOST_DEVICE constexpr auto MakeRowMajorSwizzledLayout() {
 }
 
 
+// Logical transposed layout for V:
+//
+//   logical sVt[d, key] = physical V[key, d]
+//
+// Shape:  [D, Bc]
+// Stride: [1, D]
+//
+// We write V through this tensor and read it through the same tensor.
+// This avoids inconsistent "write row-major, read transposed-swizzled" behavior.
 template <size_t Rows, size_t Cols, size_t LeadingDim>
 CUTE_HOST_DEVICE constexpr auto MakeTransposedSwizzledLayout() {
     return composition(
@@ -71,7 +90,7 @@ CUTE_HOST_DEVICE constexpr auto MakeTransposedSwizzledLayout() {
 // Row-wise operations on CuTe register accumulator tensors.
 //
 // cTensor is an identity-coordinate tensor partitioned exactly like accTensor.
-// So for every register element accTensor(i), cTensor(i) tells us its logical
+// For every register element accTensor(i), cTensor(i) tells us its logical
 // coordinate, e.g. (row, col).
 // -----------------------------------------------------------------------------
 
@@ -112,23 +131,25 @@ __forceinline__ __device__ void NormalizeAccByRow(
 //
 // accS: register tensor with logical shape [ROWS_PER_WARP, Bc].
 // cS:   identity-coordinate tensor partitioned like accS.
-// P:    shared probabilities [Br, Bc], but this warp writes only its 16 rows.
+// sP:   this warp's shared probability tile [ROWS_PER_WARP, Bc].
+//       It already has the correct swizzled layout.
+//       Therefore we write sP(row, col), not P[pLayout(...)].
+//
+// NOTE:
+//   This version intentionally keeps alpha[ROWS_PER_WARP], as requested.
 // -----------------------------------------------------------------------------
 
 template <
     typename AccTensor,
     typename CoordTensor,
-    typename PLayout,
+    typename PTensor,
     typename Element,
-    size_t ROWS_PER_WARP,
-    size_t Bc
+    size_t ROWS_PER_WARP
 >
 __forceinline__ __device__ void SoftmaxAccSToPShared(
     AccTensor& accS,
     CoordTensor const& cS,
-    Element* P,
-    size_t warpBaseRow,
-    PLayout const& pLayout,
+    PTensor& sP,
     float scale,
     float* m,
     float* denom,
@@ -137,7 +158,7 @@ __forceinline__ __device__ void SoftmaxAccSToPShared(
     float localMax[ROWS_PER_WARP];
 
     #pragma unroll
-    for (size_t r = 0; r < ROWS_PER_WARP; ++r) {
+    for (int r = 0; r < int(ROWS_PER_WARP); ++r) {
         localMax[r] = -INFINITY;
     }
 
@@ -147,6 +168,7 @@ __forceinline__ __device__ void SoftmaxAccSToPShared(
     for (int i = 0; i < size(accS); ++i) {
         auto coord = cS(i);
         int row = int(get<0>(coord));
+
         float s = float(accS(i)) * scale;
         localMax[row] = fmaxf(localMax[row], s);
     }
@@ -155,7 +177,7 @@ __forceinline__ __device__ void SoftmaxAccSToPShared(
 
     // Reduce row maxima across the warp.
     #pragma unroll
-    for (size_t r = 0; r < ROWS_PER_WARP; ++r) {
+    for (int r = 0; r < int(ROWS_PER_WARP); ++r) {
         float blockMax = ReduceWarpMax(localMax[r]);
         mNew[r] = fmaxf(m[r], blockMax);
         alpha[r] = __expf(m[r] - mNew[r]);
@@ -165,12 +187,12 @@ __forceinline__ __device__ void SoftmaxAccSToPShared(
     float localDenomAdd[ROWS_PER_WARP];
 
     #pragma unroll
-    for (size_t r = 0; r < ROWS_PER_WARP; ++r) {
+    for (int r = 0; r < int(ROWS_PER_WARP); ++r) {
         localDenomAdd[r] = 0.0f;
     }
 
     // Second pass:
-    // convert scores into probabilities P in shared memory.
+    // convert scores into probabilities P in swizzled shared memory.
     #pragma unroll
     for (int i = 0; i < size(accS); ++i) {
         auto coord = cS(i);
@@ -180,13 +202,16 @@ __forceinline__ __device__ void SoftmaxAccSToPShared(
         float s = float(accS(i)) * scale;
         float p = __expf(s - mNew[row]);
 
-        P[pLayout(warpBaseRow + row, col)] = Element(p);
+        // Correct swizzled write:
+        // sP is this warp's [16,64] tile obtained from the full swizzled P tensor.
+        sP(row, col) = Element(p);
+
         localDenomAdd[row] += p;
     }
 
     // Reduce probability sums across the warp.
     #pragma unroll
-    for (size_t r = 0; r < ROWS_PER_WARP; ++r) {
+    for (int r = 0; r < int(ROWS_PER_WARP); ++r) {
         float denomAdd = ReduceWarpSum(localDenomAdd[r]);
         denom[r] += denomAdd;
         m[r] = mNew[r];
@@ -197,10 +222,18 @@ __forceinline__ __device__ void SoftmaxAccSToPShared(
 // -----------------------------------------------------------------------------
 // Full CuTe-QK + CuTe-PV FlashAttention forward prototype.
 //
-// This version removes shared float Scores[Br, Bc].
-// QK scores live in accS register tensor.
-// Softmax reads accS directly and writes only P half shared.
-// Output accumulator accO lives in registers across all K/V blocks.
+// This version keeps the same algorithmic structure as your current CuTe kernel,
+// but fixes swizzling:
+//
+//   - one full swizzled tensor per shared tile;
+//   - warp-local Q/P views are created with local_tile;
+//   - P is written through sP(row,col), not raw P[pLayout(...)].
+//   - V is written through sVtFull(d,key) and read through the same layout.
+//
+// Still intentionally keeps:
+//   - alpha[ROWS_PER_WARP]
+//   - shared P half tile
+//   - D=64, Br=64, Bc=64, non-causal only
 // -----------------------------------------------------------------------------
 
 template <size_t BLOCK_SIZE, size_t D, size_t Br, size_t Bc>
@@ -216,8 +249,8 @@ __global__ void FlashAttnCuteKernel(
 ) {
     using Element = cutlass::half_t;
 
-    constexpr size_t NUM_WARPS = BLOCK_SIZE / 32;
-    constexpr size_t ROWS_PER_WARP = Br / NUM_WARPS;
+    constexpr int NUM_WARPS = int(BLOCK_SIZE / 32);
+    constexpr int ROWS_PER_WARP = int(Br / NUM_WARPS);
 
     static_assert(D == 64);
     static_assert(Br == 64);
@@ -226,18 +259,18 @@ __global__ void FlashAttnCuteKernel(
     static_assert(NUM_WARPS == 4);
     static_assert(ROWS_PER_WARP == 16);
 
-    size_t headIdx = blockIdx.y;
-    size_t qBaseIdx = blockIdx.x * Br;
-    size_t tid = threadIdx.x;
-    size_t warpId = tid / 32;
-    size_t laneId = tid % 32;
-    size_t warpBaseRow = warpId * ROWS_PER_WARP;
+    int headIdx = int(blockIdx.y);
+    int qBaseIdx = int(blockIdx.x) * int(Br);
+    int tid = int(threadIdx.x);
+    int warpId = tid >> 5;
+    int laneId = tid & 31;
+    int warpBaseRow = warpId * ROWS_PER_WARP;
 
     // Move pointers to the beginning of the working area.
-    q += (headIdx * N + qBaseIdx) * D;
-    out += (headIdx * N + qBaseIdx) * D;
-    k += headIdx * N * D;
-    v += headIdx * N * D;
+    q += (headIdx * N + qBaseIdx) * int(D);
+    out += (headIdx * N + qBaseIdx) * int(D);
+    k += headIdx * N * int(D);
+    v += headIdx * N * int(D);
 
     auto qElem = reinterpret_cast<Element const*>(q);
     auto kElem = reinterpret_cast<Element const*>(k);
@@ -247,46 +280,51 @@ __global__ void FlashAttnCuteKernel(
     // -------------------------------------------------------------------------
     // Shared memory.
     //
-    // No float Scores[64,64] anymore.
-    // Q/K/V/P use a small XOR swizzle in shared memory to reduce bank conflicts.
-    // P is half shared because this bridge version uses shared P for P@V.
-    //
-    // Shared memory:
-    //   Qs: 8 KB
-    //   Ks: 8 KB
-    //   Vs: 8 KB
-    //   P:  8 KB
-    // Total ~32 KB/block instead of ~40 KB/block in the previous Scores version.
+    // No float Scores[64,64].
+    // Q/K/V/P use small XOR swizzle in shared memory.
     // -------------------------------------------------------------------------
 
     __shared__ Element Qs[Br * D];       // [64, 64]
     __shared__ Element Ks[Bc * D];       // [64, 64]
-    __shared__ Element Vs[Bc * D];       // [64, 64]
+    __shared__ Element Vs[Bc * D];       // storage for logical Vt [D, Bc]
     __shared__ Element P[Br * Bc];       // [64, 64], half probabilities
 
-    auto qSwizzledLayout = MakeRowMajorSwizzledLayout<Br, D>();
-    auto kSwizzledLayout = MakeRowMajorSwizzledLayout<Bc, D>();
-    auto pSwizzledLayout = MakeRowMajorSwizzledLayout<Br, Bc>();
-    auto qWarpSwizzledLayout = MakeRowMajorSwizzledLayout<ROWS_PER_WARP, D>();
-    auto pWarpSwizzledLayout = MakeRowMajorSwizzledLayout<ROWS_PER_WARP, Bc>();
-    auto vTransposedSwizzledLayout = MakeTransposedSwizzledLayout<D, Bc, D>();
+    // -------------------------------------------------------------------------
+    // Full shared tensors with swizzled layouts.
+    //
+    // These are the only shared layouts we create.
+    // We do not create qWarpSwizzledLayout / pWarpSwizzledLayout anymore.
+    // -------------------------------------------------------------------------
+
+    Tensor sQFull = make_tensor(
+        make_smem_ptr(Qs),
+        MakeRowMajorSwizzledLayout<Br, D>()
+    );
+
+    Tensor sKFull = make_tensor(
+        make_smem_ptr(Ks),
+        MakeRowMajorSwizzledLayout<Bc, D>()
+    );
+
+    Tensor sPFull = make_tensor(
+        make_smem_ptr(P),
+        MakeRowMajorSwizzledLayout<Br, Bc>()
+    );
+
+    // Logical Vt:
+    //   sVtFull(d, key) = V[key, d]
+    Tensor sVtFull = make_tensor(
+        make_smem_ptr(Vs),
+        MakeTransposedSwizzledLayout<D, Bc, D>()
+    );
 
     // -------------------------------------------------------------------------
     // CuTe MMA setup.
     //
     // SM80_16x8x16_F32F16F16F32_TN:
-    //   A is logical [M,K]
-    //   B is logical [N,K]
-    //   C is logical [M,N]
-    //
-    // We use it twice:
-    //   1. accS = Q [16,64] @ K^T [64,64] -> [16,64]
-    //      A = Q [M,K]
-    //      B = K as [N,K] = [64,64]
-    //
-    //   2. accO += P [16,64] @ V [64,64] -> [16,64]
-    //      A = P [M,K]
-    //      B = V as [N,K], i.e. logical Vt[d,key]
+    //   A: [M,K]
+    //   B: [N,K]
+    //   C: [M,N]
     // -------------------------------------------------------------------------
 
     using MmaAtom = MMA_Atom<SM80_16x8x16_F32F16F16F32_TN>;
@@ -297,41 +335,26 @@ __global__ void FlashAttnCuteKernel(
         Tile<_16, _64, _16>{}
     );
 
-    // We run one warp-level MMA per warp, so slice by laneId.
+    // One warp-level MMA per warp.
     auto thrMma = tiledMma.get_slice(laneId);
 
     // -------------------------------------------------------------------------
-    // Warp-local shared views.
+    // Warp-local Q/P tiles.
     //
-    // Q_warp: [16, 64], row-major
-    // K:      [64, 64], logical B[N,K], row-major as [key, d]
-    // P_warp: [16, 64], row-major
-    // Vt:     [64, 64], logical B[N,K], where Vt[d, key] = V[key, d]
-    //
-    // Important:
-    //   V is physically stored as Vs[key, d] row-major.
-    //   For B operand in TN MMA we expose it as logical [N,K] = [D,Bc]:
-    //     sVt(d, key) -> Vs[key, d]
+    // local_tile preserves the full swizzled layout and only creates a logical
+    // [16,64] view for this warp.
     // -------------------------------------------------------------------------
 
-    Tensor sQ = make_tensor(
-        make_smem_ptr(Qs + warpBaseRow * D),
-        qWarpSwizzledLayout
+    Tensor sQ = local_tile(
+        sQFull,
+        make_shape(Int<ROWS_PER_WARP>{}, Int<D>{}),
+        make_coord(warpId, 0)
     );
 
-    Tensor sK = make_tensor(
-        make_smem_ptr(Ks),
-        kSwizzledLayout                          // [N,K] for QK, Ks[key, d]
-    );
-
-    Tensor sP = make_tensor(
-        make_smem_ptr(P + warpBaseRow * Bc),
-        pWarpSwizzledLayout
-    );
-
-    Tensor sVt = make_tensor(
-        make_smem_ptr(Vs),
-        vTransposedSwizzledLayout                 // [N,K] for P@V, sVt[d,key] = Vs[key,d]
+    Tensor sP = local_tile(
+        sPFull,
+        make_shape(Int<ROWS_PER_WARP>{}, Int<Bc>{}),
+        make_coord(warpId, 0)
     );
 
     // Identity tensors for logical coordinates.
@@ -345,11 +368,11 @@ __global__ void FlashAttnCuteKernel(
 
     // MMA partitions.
     Tensor tQrQ = thrMma.partition_A(sQ);
-    Tensor tKrK = thrMma.partition_B(sK);
+    Tensor tKrK = thrMma.partition_B(sKFull);
     Tensor tScS = thrMma.partition_C(cS);
 
     Tensor tPrP = thrMma.partition_A(sP);
-    Tensor tVrV = thrMma.partition_B(sVt);
+    Tensor tVrV = thrMma.partition_B(sVtFull);
     Tensor tOcO = thrMma.partition_C(cO);
 
     // Output accumulator lives in registers across the whole K/V loop.
@@ -357,14 +380,17 @@ __global__ void FlashAttnCuteKernel(
     clear(accO);
 
     // -------------------------------------------------------------------------
-    // Load Q once: global -> shared.
+    // Load Q once: global -> swizzled shared.
     // -------------------------------------------------------------------------
 
-    for (size_t i = tid; i < Br * D; i += BLOCK_SIZE) {
-        size_t row = i / D;
-        size_t col = i % D;
-        Qs[qSwizzledLayout(row, col)] = qElem[i];
+    for (int i = tid; i < int(Br * D); i += int(BLOCK_SIZE)) {
+        int row = i / int(D);
+        int col = i % int(D);
+
+        // Correct swizzled write through the tensor layout.
+        sQFull(row, col) = qElem[i];
     }
+
     __syncthreads();
 
     // Online softmax stats for this warp's 16 rows.
@@ -373,7 +399,7 @@ __global__ void FlashAttnCuteKernel(
     float alpha[ROWS_PER_WARP];
 
     #pragma unroll
-    for (size_t r = 0; r < ROWS_PER_WARP; ++r) {
+    for (int r = 0; r < ROWS_PER_WARP; ++r) {
         m[r] = -INFINITY;
         denom[r] = 0.0f;
         alpha[r] = 1.0f;
@@ -383,28 +409,29 @@ __global__ void FlashAttnCuteKernel(
     // Main loop over K/V blocks.
     // -------------------------------------------------------------------------
 
-    for (size_t kvBaseIdx = 0; kvBaseIdx < N; kvBaseIdx += Bc) {
+    for (int kvBaseIdx = 0; kvBaseIdx < N; kvBaseIdx += int(Bc)) {
         // ---------------------------------------------------------------------
-        // Load K/V block: global -> shared.
+        // Load K/V block: global -> swizzled shared.
+        //
+        // K is written/read as logical [key,d].
+        // V is written/read as logical Vt[d,key] = V[key,d].
         // ---------------------------------------------------------------------
 
-        for (size_t i = tid; i < Bc * D; i += BLOCK_SIZE) {
-            size_t row = i / D;
-            size_t col = i % D;
-            auto smemIdx = kSwizzledLayout(row, col);
-            Ks[smemIdx] = kElem[kvBaseIdx * D + i];
-            Vs[smemIdx] = vElem[kvBaseIdx * D + i];
+        for (int i = tid; i < int(Bc * D); i += int(BLOCK_SIZE)) {
+            int key = i / int(D);
+            int d = i % int(D);
+
+            sKFull(key, d) = kElem[kvBaseIdx * int(D) + i];
+            sVtFull(d, key) = vElem[kvBaseIdx * int(D) + i];
         }
+
         __syncthreads();
 
         // ---------------------------------------------------------------------
         // 1. Compute accS = Q @ K^T using CuTe MMA.
         //
         // accS is a register tensor with logical shape [16,64].
-        // This replaces:
-        //   WMMA QK -> store sFrag to shared Scores
-        //
-        // Now raw scores never touch shared memory.
+        // Raw scores never touch shared memory.
         // ---------------------------------------------------------------------
 
         Tensor accS = thrMma.make_fragment_C(tScS);
@@ -415,16 +442,15 @@ __global__ void FlashAttnCuteKernel(
         // ---------------------------------------------------------------------
         // 2. Softmax directly from accS registers.
         //
-        // This writes P half to shared for the following P@V MMA.
-        // It also updates m/denom and computes alpha for old accO rescale.
+        // Writes P into this warp's swizzled shared P tile.
+        // Keeps alpha[16] as requested.
         // ---------------------------------------------------------------------
 
-        SoftmaxAccSToPShared<decltype(accS), decltype(tScS), decltype(pSwizzledLayout), Element, ROWS_PER_WARP, Bc>(
+        SoftmaxAccSToPShared<decltype(accS), decltype(tScS), decltype(sP),
+                             Element, ROWS_PER_WARP>(
             accS,
             tScS,
-            P,
-            warpBaseRow,
-            pSwizzledLayout,
+            sP,
             scale,
             m,
             denom,
@@ -438,47 +464,32 @@ __global__ void FlashAttnCuteKernel(
 
         // ---------------------------------------------------------------------
         // 3. Rescale old output accumulator in registers.
-        //
-        // This is the online-softmax rescale:
-        //   accO[row, :] *= alpha[row]
-        //
-        // No shared O temp is used.
         // ---------------------------------------------------------------------
 
         ScaleAccByRow(accO, tOcO, alpha);
 
         // ---------------------------------------------------------------------
         // 4. accO += P @ V through CuTe MMA.
-        //
-        // P:  [16,64] from shared
-        // Vt: [64,64] logical [N,K] view over Vs[key,d]
-        // accO: [16,64] register tensor
         // ---------------------------------------------------------------------
 
         cute::gemm(tiledMma, tPrP, tVrV, accO);
 
-        // All warps must finish reading Vs before it is overwritten
-        // by the next K/V block load.
+        // All warps must finish reading K/V/P before next iteration overwrites.
         __syncthreads();
     }
 
     // -------------------------------------------------------------------------
-    // Final normalization in registers:
-    //   accO[row, :] /= denom[row]
+    // Final normalization in registers.
     // -------------------------------------------------------------------------
 
     NormalizeAccByRow(accO, tOcO, denom);
 
     // -------------------------------------------------------------------------
     // Store accO directly to global output.
-    //
-    // Output is [16,64] for this warp.
-    // We create a global tensor view and partition it like C.
-    // Then we convert fp32 accumulator to half and copy to global.
     // -------------------------------------------------------------------------
 
     Tensor gO = make_tensor(
-        make_gmem_ptr(outElem + warpBaseRow * D),
+        make_gmem_ptr(outElem + warpBaseRow * int(D)),
         make_layout(
             make_shape(Int<ROWS_PER_WARP>{}, Int<D>{}),
             make_stride(Int<D>{}, Int<1>{})
