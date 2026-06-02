@@ -2,7 +2,7 @@
 
 A small, readable FlashAttention-style forward pass implemented in CUDA C++.
 
-On an RTX A4000, the CuTe kernel is **up to 4.5x faster** than a naive PyTorch attention implementation and it does not allocate extra global workspace: it never materializes the full $N \times N$ attention matrix.
+On an RTX A4000, the CuTe kernel is **up to 4.5x faster** than a naive PyTorch attention implementation and it **does not allocate extra global workspace**: it never materializes the full $N \times N$ attention matrix.
 
 The point of this repo is not to beat the official `flash-attn` kernels. The point is to show that the core FlashAttention idea can be implemented in a compact, readable way: **~150 lines for the WMMA kernel** and around **~250 lines for the CuTe/CUTLASS kernel**.
 
