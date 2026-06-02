@@ -1,7 +1,6 @@
 #include <stdexcept>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
-#include <mma.h>
 
 #include <cutlass/numeric_types.h>
 #include <cute/tensor.hpp>
@@ -14,12 +13,11 @@
 #include "utils.cuh"
 
 
-using namespace nvcuda;
 using namespace cute;
 
 
 // -----------------------------------------------------------------------------
-// Small warp reductions used by the blockwise softmax.
+// Warp reductions
 // -----------------------------------------------------------------------------
 
 __forceinline__ __device__ float ReduceWarpSum(float x) {
@@ -29,7 +27,7 @@ __forceinline__ __device__ float ReduceWarpSum(float x) {
     x += __shfl_xor_sync(mask, x, 4);
     x += __shfl_xor_sync(mask, x, 2);
     x += __shfl_xor_sync(mask, x, 1);
-    return x; // full sum in every lane
+    return x;
 }
 
 
@@ -40,77 +38,146 @@ __forceinline__ __device__ float ReduceWarpMax(float x) {
     x = fmaxf(x, __shfl_xor_sync(mask, x, 4));
     x = fmaxf(x, __shfl_xor_sync(mask, x, 2));
     x = fmaxf(x, __shfl_xor_sync(mask, x, 1));
-    return x; // full max in every lane
+    return x;
 }
 
 
 // -----------------------------------------------------------------------------
-// Scale a CuTe register accumulator tensor by rows.
+// Row-wise operations on CuTe register accumulator tensors.
 //
-// accO is a register tensor produced by TiledMMA.
-// cO is an identity-coordinate tensor partitioned exactly like accO.
-// For each accumulator element we recover its logical row and multiply by alpha.
-//
-// This is the important part: no O shared-memory roundtrip is needed.
+// cTensor is an identity-coordinate tensor partitioned exactly like accTensor.
+// So for every register element accTensor(i), cTensor(i) tells us its logical
+// coordinate, e.g. (row, col).
 // -----------------------------------------------------------------------------
 
 template <typename AccTensor, typename CoordTensor>
-__forceinline__ __device__ void ScaleAccOByRow(
-    AccTensor& accO,
-    CoordTensor const& cO,
+__forceinline__ __device__ void ScaleAccByRow(
+    AccTensor& accTensor,
+    CoordTensor const& cTensor,
     float const* alpha
 ) {
     #pragma unroll
-    for (int i = 0; i < size(accO); ++i) {
-        auto coord = cO(i);
+    for (int i = 0; i < size(accTensor); ++i) {
+        auto coord = cTensor(i);
         int row = int(get<0>(coord));
-        accO(i) *= alpha[row];
+        accTensor(i) *= alpha[row];
     }
 }
 
 
-// -----------------------------------------------------------------------------
-// Final row-wise normalization by denominator.
-// Same idea as ScaleAccOByRow, but multiplier is 1 / denom[row].
-// -----------------------------------------------------------------------------
-
 template <typename AccTensor, typename CoordTensor>
-__forceinline__ __device__ void NormalizeAccOByRow(
-    AccTensor& accO,
-    CoordTensor const& cO,
+__forceinline__ __device__ void NormalizeAccByRow(
+    AccTensor& accTensor,
+    CoordTensor const& cTensor,
     float const* denom
 ) {
     #pragma unroll
-    for (int i = 0; i < size(accO); ++i) {
-        auto coord = cO(i);
+    for (int i = 0; i < size(accTensor); ++i) {
+        auto coord = cTensor(i);
         int row = int(get<0>(coord));
-        accO(i) *= 1.0f / denom[row];
+        accTensor(i) *= 1.0f / denom[row];
     }
 }
 
 
 // -----------------------------------------------------------------------------
-// CuTe bridge kernel.
+// Convert accS register scores into:
+//   1. row-wise softmax stats update
+//   2. P half shared tile for P @ V
 //
-// Design:
-//   - D = 64
-//   - Br = 64
-//   - Bc = 64
-//   - 4 warps per CTA
-//   - each warp owns 16 Q rows
+// accS: register tensor with logical shape [ROWS_PER_WARP, Bc].
+// cS:   identity-coordinate tensor partitioned like accS.
+// P:    shared probabilities [Br, Bc], but this warp writes only its 16 rows.
+// -----------------------------------------------------------------------------
+
+template <
+    typename AccTensor,
+    typename CoordTensor,
+    typename Element,
+    size_t ROWS_PER_WARP,
+    size_t Bc
+>
+__forceinline__ __device__ void SoftmaxAccSToPShared(
+    AccTensor& accS,
+    CoordTensor const& cS,
+    Element* P,
+    size_t warpBaseRow,
+    float scale,
+    float* m,
+    float* denom,
+    float* alpha
+) {
+    float localMax[ROWS_PER_WARP];
+
+    #pragma unroll
+    for (size_t r = 0; r < ROWS_PER_WARP; ++r) {
+        localMax[r] = -INFINITY;
+    }
+
+    // First pass over this thread's accumulator registers:
+    // collect local row maxima.
+    #pragma unroll
+    for (int i = 0; i < size(accS); ++i) {
+        auto coord = cS(i);
+        int row = int(get<0>(coord));
+        float s = float(accS(i)) * scale;
+        localMax[row] = fmaxf(localMax[row], s);
+    }
+
+    float mNew[ROWS_PER_WARP];
+
+    // Reduce row maxima across the warp.
+    #pragma unroll
+    for (size_t r = 0; r < ROWS_PER_WARP; ++r) {
+        float blockMax = ReduceWarpMax(localMax[r]);
+        mNew[r] = fmaxf(m[r], blockMax);
+        alpha[r] = __expf(m[r] - mNew[r]);
+        denom[r] *= alpha[r];
+    }
+
+    float localDenomAdd[ROWS_PER_WARP];
+
+    #pragma unroll
+    for (size_t r = 0; r < ROWS_PER_WARP; ++r) {
+        localDenomAdd[r] = 0.0f;
+    }
+
+    // Second pass:
+    // convert scores into probabilities P in shared memory.
+    #pragma unroll
+    for (int i = 0; i < size(accS); ++i) {
+        auto coord = cS(i);
+        int row = int(get<0>(coord));
+        int col = int(get<1>(coord));
+
+        float s = float(accS(i)) * scale;
+        float p = __expf(s - mNew[row]);
+
+        P[(warpBaseRow + row) * Bc + col] = Element(p);
+        localDenomAdd[row] += p;
+    }
+
+    // Reduce probability sums across the warp.
+    #pragma unroll
+    for (size_t r = 0; r < ROWS_PER_WARP; ++r) {
+        float denomAdd = ReduceWarpSum(localDenomAdd[r]);
+        denom[r] += denomAdd;
+        m[r] = mNew[r];
+    }
+}
+
+
+// -----------------------------------------------------------------------------
+// Full CuTe-QK + CuTe-PV FlashAttention forward prototype.
 //
-// This version keeps your current easy-to-read QK^T path:
-//   QK^T: WMMA -> shared Scores
-//
-// But replaces scalar output accumulator:
-//   old: float o[16][2]
-//   new: CuTe register tensor accO [16,64] per warp
-//
-// P@V is done by CuTe MMA directly into accO.
+// This version removes shared float Scores[Br, Bc].
+// QK scores live in accS register tensor.
+// Softmax reads accS directly and writes only P half shared.
+// Output accumulator accO lives in registers across all K/V blocks.
 // -----------------------------------------------------------------------------
 
 template <size_t BLOCK_SIZE, size_t D, size_t Br, size_t Bc>
-__global__ void FlashAttnCutePVKernel(
+__global__ void FlashAttnCuteKernel(
     const half* q,
     const half* k,
     const half* v,
@@ -121,7 +188,6 @@ __global__ void FlashAttnCutePVKernel(
     bool causal
 ) {
     using Element = cutlass::half_t;
-    using ElementAccum = float;
 
     constexpr size_t NUM_WARPS = BLOCK_SIZE / 32;
     constexpr size_t ROWS_PER_WARP = Br / NUM_WARPS;
@@ -140,40 +206,53 @@ __global__ void FlashAttnCutePVKernel(
     size_t laneId = tid % 32;
     size_t warpBaseRow = warpId * ROWS_PER_WARP;
 
-    // moving ptrs to the beginning of the working area
+    // Move pointers to the beginning of the working area.
     q += (headIdx * N + qBaseIdx) * D;
     out += (headIdx * N + qBaseIdx) * D;
     k += headIdx * N * D;
     v += headIdx * N * D;
 
-    // Reinterpret CUDA half pointers as CUTLASS half_t pointers for CuTe.
     auto qElem = reinterpret_cast<Element const*>(q);
     auto kElem = reinterpret_cast<Element const*>(k);
     auto vElem = reinterpret_cast<Element const*>(v);
+    auto outElem = reinterpret_cast<Element*>(out);
 
     // -------------------------------------------------------------------------
     // Shared memory.
     //
-    // Q/K/V layout is intentionally simple row-major, like in your WMMA version.
-    // Scores is still used for raw fp32 scores.
-    // P is half probabilities for CuTe P@V MMA.
+    // No float Scores[64,64] anymore.
+    // Q/K/V are still simple row-major for readability.
+    // P is half shared because this bridge version uses shared P for P@V.
     //
-    // Scores is reused at the very end as temporary float output storage.
-    // This final store is once per CTA, not once per K/V block.
+    // Shared memory:
+    //   Qs: 8 KB
+    //   Ks: 8 KB
+    //   Vs: 8 KB
+    //   P:  8 KB
+    // Total ~32 KB/block instead of ~40 KB/block in the previous Scores version.
     // -------------------------------------------------------------------------
 
     __shared__ Element Qs[Br * D];       // [64, 64]
     __shared__ Element Ks[Bc * D];       // [64, 64]
     __shared__ Element Vs[Bc * D];       // [64, 64]
     __shared__ Element P[Br * Bc];       // [64, 64], half probabilities
-    __shared__ float Scores[Br * Bc];    // [64, 64], raw scores / final temp O
 
     // -------------------------------------------------------------------------
-    // CuTe MMA setup for P @ V.
+    // CuTe MMA setup.
     //
-    // The hardware atom below is Ampere fp16 inputs -> fp32 accum.
-    // TiledMMA describes a warp-level tile. We use it per warp:
-    //   P_warp [16, 64] @ V [64, 64] -> accO [16, 64]
+    // SM80_16x8x16_F32F16F16F32_TN:
+    //   A is logical [M,K]
+    //   B is logical [N,K]
+    //   C is logical [M,N]
+    //
+    // We use it twice:
+    //   1. accS = Q [16,64] @ K^T [64,64] -> [16,64]
+    //      A = Q [M,K]
+    //      B = K as [N,K] = [64,64]
+    //
+    //   2. accO += P [16,64] @ V [64,64] -> [16,64]
+    //      A = P [M,K]
+    //      B = V as [N,K], i.e. logical Vt[d,key]
     // -------------------------------------------------------------------------
 
     using MmaAtom = MMA_Atom<SM80_16x8x16_F32F16F16F32_TN>;
@@ -184,52 +263,74 @@ __global__ void FlashAttnCutePVKernel(
         Tile<_16, _64, _16>{}
     );
 
+    // We run one warp-level MMA per warp, so slice by laneId.
     auto thrMma = tiledMma.get_slice(laneId);
 
     // -------------------------------------------------------------------------
-    // Shared-memory CuTe views for one warp's P tile and the whole V tile.
+    // Warp-local shared views.
     //
-    // P_warp shape: [16, 64]
-    // V shape:      [64, 64]
+    // Q_warp: [16, 64], row-major
+    // K:      [64, 64], logical B[N,K], row-major as [key, d]
+    // P_warp: [16, 64], row-major
+    // Vt:     [64, 64], logical B[N,K], where Vt[d, key] = V[key, d]
     //
-    // Both are row-major here to keep the first version readable.
-    // Later you can switch V to a better swizzled/transposed layout.
+    // Important:
+    //   V is physically stored as Vs[key, d] row-major.
+    //   For B operand in TN MMA we expose it as logical [N,K] = [D,Bc]:
+    //     sVt(d, key) -> Vs[key, d]
     // -------------------------------------------------------------------------
 
-    Tensor sP = make_tensor(
-        make_smem_ptr(P + warpBaseRow * Bc),
-        make_layout(make_shape(Int<ROWS_PER_WARP>{}, Int<Bc>{}), LayoutRight{})
-    );
-
-    // V is physically stored as Vs[key, d] row-major:
-    //   address = key * D + d
-    //
-    // But CuTe MMA B operand is logical B[N,K].
-    // For O = P[M,K] @ V[K,N], we expose V as Vt[N,K]:
-    //   sVt[d, key] = Vs[key, d]
-    //   address = d + key * D
-    Tensor sVt = make_tensor(
-        make_smem_ptr(Vs),
+    Tensor sQ = make_tensor(
+        make_smem_ptr(Qs + warpBaseRow * D),
         make_layout(
-            make_shape(Int<D>{}, Int<Bc>{}),     // [N,K]
-            make_stride(Int<1>{}, Int<D>{})      // address = d + key * D
+            make_shape(Int<ROWS_PER_WARP>{}, Int<D>{}),
+            make_stride(Int<D>{}, Int<1>{})
         )
     );
 
-    // Identity tensor for output coordinates [16, 64].
-    // Partitioned like C/accO, it tells us for every accumulator register
-    // which logical (row, col) it corresponds to.
+    Tensor sK = make_tensor(
+        make_smem_ptr(Ks),
+        make_layout(
+            make_shape(Int<Bc>{}, Int<D>{}),       // [N,K] for QK
+            make_stride(Int<D>{}, Int<1>{})        // Ks[key, d]
+        )
+    );
+
+    Tensor sP = make_tensor(
+        make_smem_ptr(P + warpBaseRow * Bc),
+        make_layout(
+            make_shape(Int<ROWS_PER_WARP>{}, Int<Bc>{}),
+            make_stride(Int<Bc>{}, Int<1>{})
+        )
+    );
+
+    Tensor sVt = make_tensor(
+        make_smem_ptr(Vs),
+        make_layout(
+            make_shape(Int<D>{}, Int<Bc>{}),       // [N,K] for P@V
+            make_stride(Int<1>{}, Int<D>{})        // sVt[d,key] = Vs[key,d]
+        )
+    );
+
+    // Identity tensors for logical coordinates.
+    Tensor cS = make_identity_tensor(
+        make_shape(Int<ROWS_PER_WARP>{}, Int<Bc>{})
+    );
+
     Tensor cO = make_identity_tensor(
         make_shape(Int<ROWS_PER_WARP>{}, Int<D>{})
     );
 
-    // Partition P/V/O according to the MMA layout.
+    // MMA partitions.
+    Tensor tQrQ = thrMma.partition_A(sQ);
+    Tensor tKrK = thrMma.partition_B(sK);
+    Tensor tScS = thrMma.partition_C(cS);
+
     Tensor tPrP = thrMma.partition_A(sP);
     Tensor tVrV = thrMma.partition_B(sVt);
     Tensor tOcO = thrMma.partition_C(cO);
 
-    // Register accumulator for O_warp [16, 64].
-    // O lives in registers across all K/V blocks.
+    // Output accumulator lives in registers across the whole K/V loop.
     Tensor accO = thrMma.make_fragment_C(tOcO);
     clear(accO);
 
@@ -242,7 +343,7 @@ __global__ void FlashAttnCutePVKernel(
     }
     __syncthreads();
 
-    // Online softmax stats per warp-owned row.
+    // Online softmax stats for this warp's 16 rows.
     float m[ROWS_PER_WARP];
     float denom[ROWS_PER_WARP];
     float alpha[ROWS_PER_WARP];
@@ -270,108 +371,66 @@ __global__ void FlashAttnCutePVKernel(
         __syncthreads();
 
         // ---------------------------------------------------------------------
-        // 1. Compute S = Q @ K^T.
+        // 1. Compute accS = Q @ K^T using CuTe MMA.
         //
-        // This keeps your current WMMA implementation. It is already fast and
-        // easy to read. The next possible step is rewriting this part in CuTe too.
-        //
-        // One warp computes Scores[16, 64].
-        // ---------------------------------------------------------------------
-
-        #pragma unroll
-        for (size_t colBlock = 0; colBlock < Bc; colBlock += 16) {
-            wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> qFrag;
-            wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> kFrag;
-            wmma::fragment<wmma::accumulator, 16, 16, 16, float> sFrag;
-
-            wmma::fill_fragment(sFrag, 0.0f);
-
-            #pragma unroll
-            for (size_t dBlock = 0; dBlock < D; dBlock += 16) {
-                const half* qTilePtr = reinterpret_cast<const half*>(Qs + warpBaseRow * D + dBlock);
-                const half* kTilePtr = reinterpret_cast<const half*>(Ks + colBlock * D + dBlock);
-
-                wmma::load_matrix_sync(qFrag, qTilePtr, D);
-                wmma::load_matrix_sync(kFrag, kTilePtr, D);
-                wmma::mma_sync(sFrag, qFrag, kFrag, sFrag);
-            }
-
-            float* sTilePtr = Scores + warpBaseRow * Bc + colBlock;
-            wmma::store_matrix_sync(sTilePtr, sFrag, Bc, wmma::mem_row_major);
-        }
-
-        __syncthreads();
-
-        // ---------------------------------------------------------------------
-        // 2. Blockwise online softmax.
-        //   - find block max per row
-        //   - compute alpha[row] for old accO rescale
-        //   - write P[row, col] in half for Tensor Core P@V
-        // ---------------------------------------------------------------------
-
-        #pragma unroll
-        for (size_t r = 0; r < ROWS_PER_WARP; ++r) {
-            size_t row = warpBaseRow + r;
-
-            float localMax = -INFINITY;
-
-            // each lane checks two columns: lane and lane + 32
-            #pragma unroll
-            for (size_t colLocalChunk = 0; colLocalChunk < 2; ++colLocalChunk) {
-                size_t col = laneId + colLocalChunk * 32;
-                float s = Scores[row * Bc + col] * scale;
-                localMax = fmaxf(localMax, s);
-            }
-
-            float blockMax = ReduceWarpMax(localMax);
-            float mNew = fmaxf(m[r], blockMax);
-
-            alpha[r] = __expf(m[r] - mNew);
-            denom[r] *= alpha[r];
-
-            float localDenomAdd = 0.0f;
-
-            // Convert current score block into P half in shared memory.
-            // P is used by CuTe MMA in the next section.
-            #pragma unroll
-            for (size_t colLocalChunk = 0; colLocalChunk < 2; ++colLocalChunk) {
-                size_t col = laneId + colLocalChunk * 32;
-                float s = Scores[row * Bc + col] * scale;
-                float p = __expf(s - mNew);
-
-                P[row * Bc + col] = Element(p);
-                localDenomAdd += p;
-            }
-
-            float denomAdd = ReduceWarpSum(localDenomAdd);
-            denom[r] += denomAdd;
-            m[r] = mNew;
-        }
-
-        __syncthreads();
-
-        // ---------------------------------------------------------------------
-        // 3. Rescale old accO in registers.
-        //
+        // accS is a register tensor with logical shape [16,64].
         // This replaces:
-        //   o[row][d] *= alpha[row]
+        //   WMMA QK -> store sFrag to shared Scores
         //
-        // but does it on the CuTe MMA accumulator tensor.
-        // No shared-memory O temp is used.
+        // Now raw scores never touch shared memory.
         // ---------------------------------------------------------------------
 
-        ScaleAccOByRow(accO, tOcO, alpha);
+        Tensor accS = thrMma.make_fragment_C(tScS);
+        clear(accS);
+
+        cute::gemm(tiledMma, tQrQ, tKrK, accS);
 
         // ---------------------------------------------------------------------
-        // 4. Compute accO += P @ V through CuTe MMA.
+        // 2. Softmax directly from accS registers.
         //
-        // P is [16,64] for this warp.
-        // V is [64,64] for this CTA.
-        // accO is [16,64] register accumulator.
+        // This writes P half to shared for the following P@V MMA.
+        // It also updates m/denom and computes alpha for old accO rescale.
+        // ---------------------------------------------------------------------
+
+        SoftmaxAccSToPShared<decltype(accS), decltype(tScS), Element, ROWS_PER_WARP, Bc>(
+            accS,
+            tScS,
+            P,
+            warpBaseRow,
+            scale,
+            m,
+            denom,
+            alpha
+        );
+
+        // P was written by all lanes of this warp.
+        // Other warps write different P rows, so warp sync is enough before
+        // this warp reads its own sP.
+        __syncwarp();
+
+        // ---------------------------------------------------------------------
+        // 3. Rescale old output accumulator in registers.
+        //
+        // This is the online-softmax rescale:
+        //   accO[row, :] *= alpha[row]
+        //
+        // No shared O temp is used.
+        // ---------------------------------------------------------------------
+
+        ScaleAccByRow(accO, tOcO, alpha);
+
+        // ---------------------------------------------------------------------
+        // 4. accO += P @ V through CuTe MMA.
+        //
+        // P:  [16,64] from shared
+        // Vt: [64,64] logical [N,K] view over Vs[key,d]
+        // accO: [16,64] register tensor
         // ---------------------------------------------------------------------
 
         cute::gemm(tiledMma, tPrP, tVrV, accO);
 
+        // All warps must finish reading Vs before it is overwritten
+        // by the next K/V block load.
         __syncthreads();
     }
 
@@ -380,48 +439,41 @@ __global__ void FlashAttnCutePVKernel(
     //   accO[row, :] /= denom[row]
     // -------------------------------------------------------------------------
 
-    NormalizeAccOByRow(accO, tOcO, denom);
+    NormalizeAccByRow(accO, tOcO, denom);
 
     // -------------------------------------------------------------------------
-    // Store accO.
+    // Store accO directly to global output.
     //
-    // For the first readable CuTe bridge version we store accO to shared once,
-    // then write the final output using your old lane mapping.
-    //
-    // This is only one final store/read, not once per K/V block, so it should be
-    // much cheaper than the previous WMMA-PV shared roundtrip.
-    //
-    // Scores memory is no longer needed, so we reuse it as float O temp:
-    //   Scores[warpBaseRow : warpBaseRow+16, 0:64]
+    // Output is [16,64] for this warp.
+    // We create a global tensor view and partition it like C.
+    // Then we convert fp32 accumulator to half and copy to global.
     // -------------------------------------------------------------------------
 
-    Tensor sO = make_tensor(
-        make_smem_ptr(Scores + warpBaseRow * D),
-        make_layout(make_shape(Int<ROWS_PER_WARP>{}, Int<D>{}), LayoutRight{})
+    Tensor gO = make_tensor(
+        make_gmem_ptr(outElem + warpBaseRow * D),
+        make_layout(
+            make_shape(Int<ROWS_PER_WARP>{}, Int<D>{}),
+            make_stride(Int<D>{}, Int<1>{})
+        )
     );
 
-    Tensor tOsO = thrMma.partition_C(sO);
+    Tensor tOgO = thrMma.partition_C(gO);
 
-    copy(accO, tOsO);
-
-    __syncwarp();
+    // Create a register tensor with the same layout as accO,
+    // but with half elements for the final global store.
+    auto rO = make_fragment_like<Element>(accO);
 
     #pragma unroll
-    for (size_t r = 0; r < ROWS_PER_WARP; ++r) {
-        size_t row = warpBaseRow + r;
-
-        // each lane writes two output dimensions: lane and lane + 32
-        #pragma unroll
-        for (size_t colLocalChunk = 0; colLocalChunk < 2; ++colLocalChunk) {
-            size_t d = laneId + colLocalChunk * 32;
-            out[row * D + d] = __float2half(Scores[row * D + d]);
-        }
+    for (int i = 0; i < size(accO); ++i) {
+        rO(i) = Element(accO(i));
     }
+
+    copy(rO, tOgO);
 }
 
 
 // -----------------------------------------------------------------------------
-// Launcher.
+// Launcher
 // -----------------------------------------------------------------------------
 
 void launch_flash_attn_forward(
@@ -441,7 +493,7 @@ void launch_flash_attn_forward(
     constexpr size_t Bc = 64;
 
     if (D != 64) {
-        throw std::runtime_error("Only D=64 is supported yet");
+        throw std::runtime_error("This CuTe prototype supports only D=64 yet");
     }
     if (N % Br != 0 || N % Bc != 0) {
         throw std::runtime_error("Only N divisible by " + std::to_string(Br) + " and " + std::to_string(Bc) + " are supported yet");
@@ -450,14 +502,12 @@ void launch_flash_attn_forward(
         throw std::runtime_error("Causal attention is not yet supported");
     }
 
-    // each block processes one Q block in one BH item
-    // grid.x: Q blocks
-    // grid.y: batch * heads
     dim3 gridDim(::ceil_div(N, Br), BH);
     dim3 blockSize(BLOCK_SIZE);
 
-    FlashAttnCutePVKernel<BLOCK_SIZE, 64, Br, Bc><<<gridDim, blockSize, 0, stream>>>(
+    FlashAttnCuteKernel<BLOCK_SIZE, 64, Br, Bc><<<gridDim, blockSize, 0, stream>>>(
         q, k, v, out, BH, N, scale, causal
     );
+
     check_cuda(cudaGetLastError());
 }
