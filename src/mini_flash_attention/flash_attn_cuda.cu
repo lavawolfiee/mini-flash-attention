@@ -5,6 +5,7 @@
 #include <cutlass/numeric_types.h>
 #include <cute/tensor.hpp>
 #include <cute/layout.hpp>
+#include <cute/swizzle_layout.hpp>
 #include <cute/algorithm/copy.hpp>
 #include <cute/algorithm/gemm.hpp>
 #include <cute/atom/mma_atom.hpp>
@@ -39,6 +40,30 @@ __forceinline__ __device__ float ReduceWarpMax(float x) {
     x = fmaxf(x, __shfl_xor_sync(mask, x, 2));
     x = fmaxf(x, __shfl_xor_sync(mask, x, 1));
     return x;
+}
+
+
+template <size_t Rows, size_t Cols>
+CUTE_HOST_DEVICE constexpr auto MakeRowMajorSwizzledLayout() {
+    return composition(
+        Swizzle<3, 3, 3>{},
+        make_layout(
+            make_shape(Int<Rows>{}, Int<Cols>{}),
+            make_stride(Int<Cols>{}, Int<1>{})
+        )
+    );
+}
+
+
+template <size_t Rows, size_t Cols, size_t LeadingDim>
+CUTE_HOST_DEVICE constexpr auto MakeTransposedSwizzledLayout() {
+    return composition(
+        Swizzle<3, 3, 3>{},
+        make_layout(
+            make_shape(Int<Rows>{}, Int<Cols>{}),
+            make_stride(Int<1>{}, Int<LeadingDim>{})
+        )
+    );
 }
 
 
@@ -93,16 +118,17 @@ __forceinline__ __device__ void NormalizeAccByRow(
 template <
     typename AccTensor,
     typename CoordTensor,
+    typename PLayout,
     typename Element,
     size_t ROWS_PER_WARP,
-    size_t Bc,
-    size_t Bc_PAD
+    size_t Bc
 >
 __forceinline__ __device__ void SoftmaxAccSToPShared(
     AccTensor& accS,
     CoordTensor const& cS,
     Element* P,
     size_t warpBaseRow,
+    PLayout const& pLayout,
     float scale,
     float* m,
     float* denom,
@@ -154,7 +180,7 @@ __forceinline__ __device__ void SoftmaxAccSToPShared(
         float s = float(accS(i)) * scale;
         float p = __expf(s - mNew[row]);
 
-        P[(warpBaseRow + row) * Bc_PAD + col] = Element(p);
+        P[pLayout(warpBaseRow + row, col)] = Element(p);
         localDenomAdd[row] += p;
     }
 
@@ -222,7 +248,7 @@ __global__ void FlashAttnCuteKernel(
     // Shared memory.
     //
     // No float Scores[64,64] anymore.
-    // Q/K/V are still simple row-major for readability.
+    // Q/K/V/P use a small XOR swizzle in shared memory to reduce bank conflicts.
     // P is half shared because this bridge version uses shared P for P@V.
     //
     // Shared memory:
@@ -233,13 +259,17 @@ __global__ void FlashAttnCuteKernel(
     // Total ~32 KB/block instead of ~40 KB/block in the previous Scores version.
     // -------------------------------------------------------------------------
 
-    constexpr size_t D_PAD = 72;
-    constexpr size_t Bc_PAD = 72;
+    __shared__ Element Qs[Br * D];       // [64, 64]
+    __shared__ Element Ks[Bc * D];       // [64, 64]
+    __shared__ Element Vs[Bc * D];       // [64, 64]
+    __shared__ Element P[Br * Bc];       // [64, 64], half probabilities
 
-    __shared__ Element Qs[Br * D_PAD];       // [64, 64]
-    __shared__ Element Ks[Bc * D_PAD];       // [64, 64]
-    __shared__ Element Vs[Bc * D_PAD];       // [64, 64]
-    __shared__ Element P[Br * Bc_PAD];       // [64, 64], half probabilities
+    auto qSwizzledLayout = MakeRowMajorSwizzledLayout<Br, D>();
+    auto kSwizzledLayout = MakeRowMajorSwizzledLayout<Bc, D>();
+    auto pSwizzledLayout = MakeRowMajorSwizzledLayout<Br, Bc>();
+    auto qWarpSwizzledLayout = MakeRowMajorSwizzledLayout<ROWS_PER_WARP, D>();
+    auto pWarpSwizzledLayout = MakeRowMajorSwizzledLayout<ROWS_PER_WARP, Bc>();
+    auto vTransposedSwizzledLayout = MakeTransposedSwizzledLayout<D, Bc, D>();
 
     // -------------------------------------------------------------------------
     // CuTe MMA setup.
@@ -285,35 +315,23 @@ __global__ void FlashAttnCuteKernel(
     // -------------------------------------------------------------------------
 
     Tensor sQ = make_tensor(
-        make_smem_ptr(Qs + warpBaseRow * D_PAD),
-        make_layout(
-            make_shape(Int<ROWS_PER_WARP>{}, Int<D>{}),
-            make_stride(Int<D_PAD>{}, Int<1>{})
-        )
+        make_smem_ptr(Qs + warpBaseRow * D),
+        qWarpSwizzledLayout
     );
 
     Tensor sK = make_tensor(
         make_smem_ptr(Ks),
-        make_layout(
-            make_shape(Int<Bc>{}, Int<D>{}),       // [N,K] for QK
-            make_stride(Int<D_PAD>{}, Int<1>{})        // Ks[key, d]
-        )
+        kSwizzledLayout                          // [N,K] for QK, Ks[key, d]
     );
 
     Tensor sP = make_tensor(
-        make_smem_ptr(P + warpBaseRow * Bc_PAD),
-        make_layout(
-            make_shape(Int<ROWS_PER_WARP>{}, Int<Bc>{}),
-            make_stride(Int<Bc_PAD>{}, Int<1>{})
-        )
+        make_smem_ptr(P + warpBaseRow * Bc),
+        pWarpSwizzledLayout
     );
 
     Tensor sVt = make_tensor(
         make_smem_ptr(Vs),
-        make_layout(
-            make_shape(Int<D>{}, Int<Bc>{}),       // [N,K] for P@V
-            make_stride(Int<1>{}, Int<D_PAD>{})        // sVt[d,key] = Vs[key,d]
-        )
+        vTransposedSwizzledLayout                 // [N,K] for P@V, sVt[d,key] = Vs[key,d]
     );
 
     // Identity tensors for logical coordinates.
@@ -345,7 +363,7 @@ __global__ void FlashAttnCuteKernel(
     for (size_t i = tid; i < Br * D; i += BLOCK_SIZE) {
         size_t row = i / D;
         size_t col = i % D;
-        Qs[row * D_PAD + col] = qElem[i];
+        Qs[qSwizzledLayout(row, col)] = qElem[i];
     }
     __syncthreads();
 
@@ -373,8 +391,9 @@ __global__ void FlashAttnCuteKernel(
         for (size_t i = tid; i < Bc * D; i += BLOCK_SIZE) {
             size_t row = i / D;
             size_t col = i % D;
-            Ks[row * D_PAD + col] = kElem[kvBaseIdx * D + i];
-            Vs[row * D_PAD + col] = vElem[kvBaseIdx * D + i];
+            auto smemIdx = kSwizzledLayout(row, col);
+            Ks[smemIdx] = kElem[kvBaseIdx * D + i];
+            Vs[smemIdx] = vElem[kvBaseIdx * D + i];
         }
         __syncthreads();
 
@@ -400,11 +419,12 @@ __global__ void FlashAttnCuteKernel(
         // It also updates m/denom and computes alpha for old accO rescale.
         // ---------------------------------------------------------------------
 
-        SoftmaxAccSToPShared<decltype(accS), decltype(tScS), Element, ROWS_PER_WARP, Bc, Bc_PAD>(
+        SoftmaxAccSToPShared<decltype(accS), decltype(tScS), decltype(pSwizzledLayout), Element, ROWS_PER_WARP, Bc>(
             accS,
             tScS,
             P,
             warpBaseRow,
+            pSwizzledLayout,
             scale,
             m,
             denom,
