@@ -250,7 +250,7 @@ __global__ void FlashAttnWmmaQKKernel(
 }
 
 
-void launch_flash_attn_forward(
+void launch_flash_attn_forward_wmma(
     const half* q,
     const half* k,
     const half* v,
