@@ -95,8 +95,8 @@ class WmmaBackend:
         return self.forward(q, k, v, causal=causal)
 
 
-class TorchBackend:
-    name = "torch"
+class TorchOldBackend:
+    name = "torch_old"
 
     def prepare(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> PreparedInput:
         return q, k, v
@@ -113,6 +113,53 @@ class TorchBackend:
 
         probs = torch.softmax(scores, dim=-1)
         return (probs @ v.float()).to(q.dtype)
+
+
+class TorchFp16Backend:
+    name = "torch_fp16"
+
+    def prepare(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> PreparedInput:
+        return q, k, v
+
+    def run(self, inputs: PreparedInput, causal: bool) -> torch.Tensor:
+        q, k, v = inputs
+        scale = q.shape[-1] ** -0.5
+        scores = q @ k.transpose(-2, -1) * scale
+
+        if causal:
+            seq_len = q.shape[-2]
+            mask = torch.ones((seq_len, seq_len), dtype=torch.bool, device=q.device).triu(1)
+            scores = scores.masked_fill(mask, float("-inf"))
+
+        probs = torch.softmax(scores, dim=-1)
+        return (probs @ v).to(q.dtype)
+
+
+class TorchFp16CompileBackend:
+    name = "torch_fp16_compile"
+
+    def __init__(self) -> None:
+        self._compiled = torch.compile(self._forward, mode="reduce-overhead")
+
+    @staticmethod
+    def _forward(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, causal: bool) -> torch.Tensor:
+        scale = q.shape[-1] ** -0.5
+        scores = q @ k.transpose(-2, -1) * scale
+
+        if causal:
+            seq_len = q.shape[-2]
+            mask = torch.ones((seq_len, seq_len), dtype=torch.bool, device=q.device).triu(1)
+            scores = scores.masked_fill(mask, float("-inf"))
+
+        probs = torch.softmax(scores, dim=-1)
+        return (probs @ v).to(q.dtype)
+
+    def prepare(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> PreparedInput:
+        return q, k, v
+
+    def run(self, inputs: PreparedInput, causal: bool) -> torch.Tensor:
+        q, k, v = inputs
+        return self._compiled(q, k, v, causal)
 
 
 class FlashAttention1Backend:
@@ -176,7 +223,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--backend",
         required=True,
-        choices=["ours", "wmma", "torch", "fa1", "fa2"],
+        choices=["ours", "wmma", "torch_old", "torch_fp16", "torch_fp16_compile", "fa1", "fa2"],
         help="Implementation to benchmark. FA1 and FA2 should run in separate environments.",
     )
     parser.add_argument("--out", type=Path, default=Path("benchs/results/forward.jsonl"))
@@ -198,8 +245,12 @@ def load_backend(name: str) -> Backend:
         return OursBackend()
     if name == "wmma":
         return WmmaBackend()
-    if name == "torch":
-        return TorchBackend()
+    if name == "torch_old":
+        return TorchOldBackend()
+    if name == "torch_fp16":
+        return TorchFp16Backend()
+    if name == "torch_fp16_compile":
+        return TorchFp16CompileBackend()
     if name == "fa1":
         return FlashAttention1Backend()
     if name == "fa2":

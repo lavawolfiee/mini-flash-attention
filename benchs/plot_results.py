@@ -12,14 +12,16 @@ METRICS = {
     "tflops": ("tflops_s", "TFLOPs/s", "tflops_bars.png"),
 }
 
-BACKEND_ORDER = ["fa2", "fa1", "ours", "wmma", "torch"]
+BACKEND_ORDER = ["fa2", "fa1", "ours", "wmma", "torch_fp16_compile", "torch_fp16", "torch_old"]
 
 BACKEND_LABELS = {
     "fa2": "FlashAttention-2",
     "fa1": "FlashAttention-1",
     "ours": "Ours (CuTe)",
     "wmma": "Ours (WMMA)",
-    "torch": "Pytorch",
+    "torch_fp16_compile": "PyTorch (fp16 + compile)",
+    "torch_fp16": "PyTorch (fp16)",
+    "torch_old": "PyTorch (old)",
 }
 
 
